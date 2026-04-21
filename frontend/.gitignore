@@ -5,6 +5,11 @@
 /.pnp
 .pnp.js
 
+.env
+__pycache__/
+*.pyc
+
+
 # testing
 /coverage
 
@@ -21,9 +26,3 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-
-node_modules/
-.env
-__pycache__/
-*.pyc
-*.log
