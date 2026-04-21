@@ -1,230 +1,282 @@
 import asyncio
 import re
 import traceback
-from llm_clients import call_openrouter, call_gemini
+
+from llm_clients import call_openrouter, call_gemini_safe, call_huggingface
 from hallucination import HallucinationScorer
 
 scorer = HallucinationScorer()
-
-# ====================== PROMPTS ======================
 
 PRO_PROMPT = """You are the PRO side in a debate.
 Topic: {query}
 
 Give exactly 5 strong, numbered arguments in favor.
-Format strictly like this (no extra text):
+Format strictly like this (no extra text before or after):
 
-1. First argument...
-2. Second argument...
-3. ...
+1. First argument here.
+2. Second argument here.
+3. Third argument here.
+4. Fourth argument here.
+5. Fifth argument here.
 
-Keep each point concise and persuasive."""
+Keep each point concise and persuasive. Do NOT add any preamble or conclusion."""
 
 CON_PROMPT = """You are the CON side in a debate.
 Topic: {query}
 
 Give exactly 5 strong, numbered arguments against.
-Format strictly like this (no extra text):
+Format strictly like this (no extra text before or after):
 
-1. First argument...
-2. Second argument...
-3. ...
+1. First argument here.
+2. Second argument here.
+3. Third argument here.
+4. Fourth argument here.
+5. Fifth argument here.
 
-Keep each point concise and persuasive."""
+Keep each point concise and persuasive. Do NOT add any preamble or conclusion."""
 
-PRO_REBUTTAL = """You are the PRO side.
-Topic: {query}
+PRO_REBUTTAL_PROMPT = """You are the PRO side in a debate about: {query}
 
-Rebut the following CON arguments:
-{con}
+The CON side said:
+{con_args}
 
-Give 4-5 numbered rebuttals.
-Format strictly like this:
+Give 4 sharp rebuttals, numbered 1-4. No extra text before or after.
 
-1. Rebuttal...
-2. Rebuttal...
-"""
+1. First rebuttal.
+2. Second rebuttal.
+3. Third rebuttal.
+4. Fourth rebuttal."""
 
-CON_REBUTTAL = """You are the CON side.
-Topic: {query}
+CON_REBUTTAL_PROMPT = """You are the CON side in a debate about: {query}
 
-Rebut the following PRO arguments:
-{pro}
+The PRO side said:
+{pro_args}
 
-Give 4-5 numbered rebuttals.
-Format strictly like this:
+Give 4 sharp rebuttals, numbered 1-4. No extra text before or after.
 
-1. Rebuttal...
-2. Rebuttal...
-"""
+1. First rebuttal.
+2. Second rebuttal.
+3. Third rebuttal.
+4. Fourth rebuttal."""
 
 JUDGE_PROMPT = """You are an impartial debate judge.
-
 Topic: {query}
 
 PRO arguments:
-{pro}
+{pro_args}
 
 CON arguments:
-{con}
+{con_args}
 
-PRO rebuttals:
-{pro_reb}
+Decide which side made the stronger overall case.
+Reply in this EXACT format — no other text, no markdown, nothing else:
 
-CON rebuttals:
-{con_reb}
-
-Decide the winner and respond in EXACTLY this format (nothing else):
-
-WINNER: PRO or CON
-CONFIDENCE: 0.xx
-REASONING: [2-3 sentence explanation]"""
-
-# ====================== PARSERS ======================
-
-def parse_numbered(text: str):
-    if not text or isinstance(text, Exception):
-        return ["Failed to get response from LLM."]
-    matches = re.findall(r'^\s*\d+\.\s*(.+)', text, re.MULTILINE)
-    if matches:
-        return [m.strip() for m in matches][:6]
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    return lines[:6] or ["No clear arguments generated."]
+WINNER: PRO
+CONFIDENCE: 0.72
+REASONING: One sentence explaining your decision."""
 
 
-def parse_judge(raw: str):
-    if not raw or isinstance(raw, Exception):
-        return {
-            "winner": "PRO",
-            "confidence": 0.6,
-            "reasoning": "Judge could not process the debate."
-        }
-    winner_match = re.search(r'WINNER:\s*(PRO|CON)', raw, re.IGNORECASE)
-    conf_match = re.search(r'CONFIDENCE:\s*([0-9.]+)', raw)
-    reasoning_match = re.search(r'REASONING:\s*(.+)', raw, re.DOTALL | re.IGNORECASE)
-    return {
-        "winner": winner_match.group(1).upper() if winner_match else "PRO",
-        "confidence": float(conf_match.group(1)) if conf_match else 0.65,
-        "reasoning": reasoning_match.group(1).strip() if reasoning_match else raw[:300]
-    }
+def _parse_numbered(text: str, limit: int = 5) -> list:
+    if not text:
+        return []
 
-# ====================== MAIN ENGINE ======================
+    lines = []
+    for line in text.split("\n"):
+        line = line.strip()
+        m = re.match(r"^(\d+)[\.\):\-]\s+(.+)", line)
+        if m:
+            content = m.group(2).strip()
+            if content:
+                lines.append(content)
+
+    if not lines:
+        lines = [l.strip() for l in text.split("\n") if l.strip() and not l.strip().startswith("#")]
+
+    deduped = []
+    seen = set()
+    for item in lines:
+        key = item.lower()
+        if key not in seen:
+            deduped.append(item)
+            seen.add(key)
+
+    return deduped[:limit]
+
+
+def _parse_judge(text: str) -> dict:
+    winner = "PRO"
+    confidence = 0.65
+    reasoning = "Arguments evaluated by judge."
+
+    if not text:
+        return {"winner": winner, "confidence": confidence, "reasoning": reasoning}
+
+    upper = text.upper()
+
+    m = re.search(r"WINNER\s*[:=]\s*(PRO|CON)", upper)
+    if m:
+        winner = m.group(1)
+
+    m = re.search(r"CONFIDENCE\s*[:=]\s*([0-9.]+)", text, re.IGNORECASE)
+    if m:
+        try:
+            c = float(m.group(1))
+            confidence = c / 100 if c > 1 else c
+            confidence = max(0.5, min(confidence, 0.99))
+        except Exception:
+            pass
+
+    m = re.search(r"REASONING\s*[:=]\s*(.+)", text, re.IGNORECASE)
+    if m:
+        reasoning = m.group(1).strip()
+    else:
+        for line in text.split("\n"):
+            line = line.strip()
+            if line and not re.match(r"^(WINNER|CONFIDENCE)", line, re.IGNORECASE):
+                reasoning = line
+                break
+
+    return {"winner": winner, "confidence": confidence, "reasoning": reasoning}
+
+
+def _safe_text(val) -> str:
+    return str(val).strip() if val else ""
+
 
 class DebateEngine:
     async def run(self, query: str) -> dict:
         try:
-            print("\n🚀 STARTING DEBATE ENGINE")
-            print("🧠 Topic:", query)
+            print(f"\n🚀 STARTING DEBATE: {query}")
 
-            # ===== PRO: OpenRouter =====
-            print("\n📢 [OpenRouter] Generating PRO arguments...")
-            try:
-                pro_raw = await call_openrouter(PRO_PROMPT.format(query=query))
-                print("✅ PRO RAW:", pro_raw[:200])
-            except Exception as e:
-                print("❌ PRO ERROR:", str(e))
-                pro_raw = e
-
-            # ===== CON: Gemini =====
-            print("\n📢 [Gemini] Generating CON arguments...")
-            try:
-                con_raw = await call_gemini(CON_PROMPT.format(query=query))
-                print("✅ CON RAW:", con_raw[:200])
-            except Exception as e:
-                print("❌ CON ERROR (Gemini):", str(e))
-                # Fallback to OpenRouter if Gemini fails
-                try:
-                    print("🔄 Falling back to OpenRouter for CON...")
-                    con_raw = await call_openrouter(CON_PROMPT.format(query=query))
-                except Exception as e2:
-                    print("❌ CON FALLBACK ERROR:", str(e2))
-                    con_raw = e2
-
-            pro_args = parse_numbered(pro_raw)
-            con_args = parse_numbered(con_raw)
-
-            # ===== PRO Rebuttals: Gemini =====
-            print("\n⚔️ [Gemini] Generating PRO rebuttals...")
-            try:
-                pro_reb_raw = await call_gemini(
-                    PRO_REBUTTAL.format(query=query, con="\n".join(con_args[:4]))
-                )
-                print("✅ PRO REBUTTALS RAW:", pro_reb_raw[:200])
-            except Exception as e:
-                print("❌ PRO REBUTTAL ERROR (Gemini):", str(e))
-                try:
-                    print("🔄 Falling back to OpenRouter for PRO rebuttals...")
-                    pro_reb_raw = await call_openrouter(
-                        PRO_REBUTTAL.format(query=query, con="\n".join(con_args[:4]))
-                    )
-                except Exception as e2:
-                    pro_reb_raw = e2
-
-            # ===== CON Rebuttals: OpenRouter =====
-            print("\n⚔️ [OpenRouter] Generating CON rebuttals...")
-            try:
-                con_reb_raw = await call_openrouter(
-                    CON_REBUTTAL.format(query=query, pro="\n".join(pro_args[:4]))
-                )
-                print("✅ CON REBUTTALS RAW:", con_reb_raw[:200])
-            except Exception as e:
-                print("❌ CON REBUTTAL ERROR:", str(e))
-                con_reb_raw = e
-
-            pro_rebuttals = parse_numbered(pro_reb_raw)
-            con_rebuttals = parse_numbered(con_reb_raw)
-
-            # ===== Judge: Gemini (neutral third party) =====
-            print("\n⚖️ [Gemini] Generating JUDGE decision...")
-            try:
-                judge_prompt = JUDGE_PROMPT.format(
-                    query=query,
-                    pro="\n".join(pro_args),
-                    con="\n".join(con_args),
-                    pro_reb="\n".join(pro_rebuttals),
-                    con_reb="\n".join(con_rebuttals)
-                )
-                judge_raw = await call_gemini(judge_prompt)
-                print("✅ JUDGE RAW:", judge_raw[:200])
-            except Exception as e:
-                print("❌ JUDGE ERROR (Gemini):", str(e))
-                try:
-                    print("🔄 Falling back to OpenRouter for judge...")
-                    judge_raw = await call_openrouter(judge_prompt)
-                except Exception as e2:
-                    judge_raw = e2
-
-            verdict = parse_judge(judge_raw)
-
-            # ===== Hallucination Scoring =====
-            print("\n🧪 Scoring hallucination...")
-            h_scores = scorer.score(
-                ["OpenRouter (PRO)", "Gemini (CON)", "Gemini (Judge)"],
-                [
-                    pro_raw if isinstance(pro_raw, str) else "",
-                    con_raw if isinstance(con_raw, str) else "",
-                    judge_raw if isinstance(judge_raw, str) else "",
-                ]
+            print("📢 Generating arguments in parallel...")
+            pro_task = asyncio.create_task(
+                call_openrouter(PRO_PROMPT.format(query=query), label="PRO")
             )
-            worst = max(h_scores, key=lambda x: x["hallucination_score"])["model"]
+            con_task = asyncio.create_task(
+                call_gemini_safe(CON_PROMPT.format(query=query))
+            )
 
-            print("\n🎯 DEBATE COMPLETE\n")
+            results = await asyncio.gather(pro_task, con_task, return_exceptions=True)
+
+            pro_raw = results[0] if not isinstance(results[0], Exception) else ""
+            con_raw = results[1] if not isinstance(results[1], Exception) else ""
+
+            if not pro_raw:
+                print("  ⚠ PRO task failed, retrying once via OpenRouter")
+                pro_raw = await call_openrouter(PRO_PROMPT.format(query=query), label="PRO-retry")
+
+            if not con_raw:
+                print("  ⚠ CON task failed, retrying once via Gemini/OpenRouter safe path")
+                con_raw = await call_gemini_safe(CON_PROMPT.format(query=query))
+
+            pro_args = _parse_numbered(pro_raw, 5)
+            con_args = _parse_numbered(con_raw, 5)
+
+            if not pro_args:
+                pro_args = [f"PRO argument {i + 1} for: {query}" for i in range(5)]
+            if not con_args:
+                con_args = [f"CON argument {i + 1} for: {query}" for i in range(5)]
+
+            print(f"   PRO: {len(pro_args)} args | CON: {len(con_args)} args")
+
+            print("🔁 Generating rebuttals...")
+            pro_reb_task = asyncio.create_task(
+                call_gemini_safe(
+                    PRO_REBUTTAL_PROMPT.format(
+                        query=query,
+                        con_args="\n".join(f"{i + 1}. {a}" for i, a in enumerate(con_args)),
+                    )
+                )
+            )
+            con_reb_task = asyncio.create_task(
+                call_openrouter(
+                    CON_REBUTTAL_PROMPT.format(
+                        query=query,
+                        pro_args="\n".join(f"{i + 1}. {a}" for i, a in enumerate(pro_args)),
+                    ),
+                    label="CON-rebuttal",
+                )
+            )
+
+            reb_results = await asyncio.gather(pro_reb_task, con_reb_task, return_exceptions=True)
+
+            pro_reb_raw = reb_results[0] if not isinstance(reb_results[0], Exception) else ""
+            con_reb_raw = reb_results[1] if not isinstance(reb_results[1], Exception) else ""
+
+            pro_rebuttals = _parse_numbered(pro_reb_raw, 4)
+            con_rebuttals = _parse_numbered(con_reb_raw, 4)
+
+            print("⚖️ Running judges in parallel...")
+            judge_prompt = JUDGE_PROMPT.format(
+                query=query,
+                pro_args="\n".join(f"{i + 1}. {a}" for i, a in enumerate(pro_args)),
+                con_args="\n".join(f"{i + 1}. {a}" for i, a in enumerate(con_args)),
+            )
+
+            j1_task = asyncio.create_task(call_openrouter(judge_prompt, label="Judge-1"))
+            j2_task = asyncio.create_task(call_huggingface(judge_prompt))
+            j3_task = asyncio.create_task(call_gemini_safe(judge_prompt))
+
+            judge_results = await asyncio.gather(j1_task, j2_task, j3_task, return_exceptions=True)
+
+            pro_score = sum(len(a) for a in pro_args)
+            con_score = sum(len(a) for a in con_args)
+            heuristic = {
+                "winner": "PRO" if pro_score >= con_score else "CON",
+                "confidence": 0.60,
+                "reasoning": "Heuristic: evaluated argument density and depth.",
+            }
+
+            parsed_judges = []
+            for idx, raw in enumerate(judge_results, start=1):
+                if isinstance(raw, Exception) or not str(raw).strip():
+                    print(f"  ⚠ Judge {idx} failed — using heuristic fallback")
+                    parsed_judges.append(heuristic)
+                else:
+                    parsed_judges.append(_parse_judge(raw))
+
+            while len(parsed_judges) < 3:
+                parsed_judges.append(heuristic)
+
+            pro_votes = sum(1 for v in parsed_judges if v["winner"] == "PRO")
+            con_votes = len(parsed_judges) - pro_votes
+            final_decision = "PRO" if pro_votes >= 2 else "CON"
+            avg_confidence = round(
+                sum(v["confidence"] for v in parsed_judges) / len(parsed_judges), 4
+            )
+            winning_reasoning = next(
+                (v["reasoning"] for v in parsed_judges if v["winner"] == final_decision),
+                "Consensus reached by majority vote.",
+            )
+
+            model_names = ["OpenRouter (PRO)", "Gemini/OpenRouter (CON)", "Heuristic Judge"]
+            texts = [
+                _safe_text(pro_raw),
+                _safe_text(con_raw),
+                " ".join(pro_args + con_args),
+            ]
+            hall_scores = scorer.score(model_names, texts)
+            most_hallucinating = hall_scores[0]["model"] if hall_scores else "None"
+
+            print(f"✅ DEBATE COMPLETE — Winner: {final_decision} ({pro_votes}-{con_votes})")
 
             return {
                 "pro_arguments": pro_args,
                 "con_arguments": con_args,
                 "rebuttals": {
                     "pro_rebuttals": pro_rebuttals,
-                    "con_rebuttals": con_rebuttals
+                    "con_rebuttals": con_rebuttals,
                 },
-                "final_decision": verdict["winner"],
-                "confidence": verdict["confidence"],
-                "reasoning": verdict["reasoning"],
-                "hallucination_scores": h_scores,
-                "most_hallucinating_model": worst,
+                "final_decision": final_decision,
+                "confidence": avg_confidence,
+                "reasoning": winning_reasoning,
+                "judge_votes": {"PRO": pro_votes, "CON": con_votes},
+                "individual_verdicts": parsed_judges,
+                "hallucination_scores": hall_scores,
+                "most_hallucinating_model": most_hallucinating,
             }
 
         except Exception as e:
             print("=== DEBATE ENGINE CRASH ===")
             traceback.print_exc()
-            raise Exception(f"Internal Error: {str(e)}")
+            raise Exception(f"Debate engine error: {str(e)}")

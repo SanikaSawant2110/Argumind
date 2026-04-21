@@ -1,38 +1,36 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
 import time
-import os
-import json
 import re
+import json
+import asyncio
 from dotenv import load_dotenv
+
 from debate_engine import DebateEngine
-from hallucination import HallucinationScorer
-from export import build_excel
-from llm_clients import call_openrouter, call_gemini
+from export import build_excel, auto_save_excel
+from llm_clients import call_openrouter, call_gemini_safe
 
 load_dotenv()
 
-app = FastAPI(title="Argumind Debate API", version="2.0.0")
+print("✅ Argumind Backend Starting...")
+
+app = FastAPI(title="Argumind", version="3.5.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 engine = DebateEngine()
-scorer = HallucinationScorer()
-debate_history = []
+debate_history: list = []
 
-
-# ─── Models ───────────────────────────────────────────────────────────────────
 
 class AnalyzeRequest(BaseModel):
     query: str
+
 
 class ArgumentRequest(BaseModel):
     topic: str
@@ -40,326 +38,320 @@ class ArgumentRequest(BaseModel):
     audience: str = "General Public"
     tone: str = "Academic"
 
+
 class RebuttalRequest(BaseModel):
     argument: str
+
 
 class PersonaRequest(BaseModel):
     topic: str
     persona_name: str
     persona_desc: str
 
+
 class EvidenceRequest(BaseModel):
     topic: str
     category: str = "General"
+
 
 class InsightsRequest(BaseModel):
     topic: str
     winner: str
     confidence: float
-    pro_args: Optional[List[str]] = []
-    con_args: Optional[List[str]] = []
+    pro_args: list
+    con_args: list
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def safe_json(text: str) -> dict:
-    """Extract JSON from LLM response, stripping markdown fences."""
-    text = text.strip()
-    text = re.sub(r'^```[a-zA-Z]*\n?', '', text)
-    text = re.sub(r'\n?```$', '', text)
-    return json.loads(text.strip())
+def _strip_json_fences(raw: str) -> str:
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    return raw.strip()
 
 
-async def call_with_fallback(prompt: str, primary: str = "gemini") -> str:
-    """Call Gemini first, fall back to OpenRouter on failure."""
-    if primary == "gemini":
+def _extract_json(raw: str) -> dict:
+    cleaned = _strip_json_fences(raw)
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = cleaned[start:end + 1]
         try:
-            return await call_gemini(prompt)
-        except Exception as e:
-            print(f"⚠️ Gemini failed ({e}), falling back to OpenRouter...")
-            return await call_openrouter(prompt)
-    else:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
         try:
-            return await call_openrouter(prompt)
-        except Exception as e:
-            print(f"⚠️ OpenRouter failed ({e}), falling back to Gemini...")
-            return await call_gemini(prompt)
+            fixed = re.sub(r",\s*([}\]])", r"\1", candidate)
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(f"Could not parse JSON from response. Raw (first 300 chars): {raw[:300]}")
 
 
-# ─── Routes ───────────────────────────────────────────────────────────────────
+async def llm_json(prompt: str, use_gemini_first: bool = False) -> dict:
+    providers = (
+        [
+            ("gemini", call_gemini_safe),
+            ("openrouter", lambda p: call_openrouter(p, label="json-task")),
+        ]
+        if use_gemini_first
+        else [
+            ("openrouter", lambda p: call_openrouter(p, label="json-task")),
+            ("gemini", call_gemini_safe),
+        ]
+    )
+
+    last_err = None
+    for name, provider in providers:
+        for attempt in range(2):
+            try:
+                raw = await provider(prompt)
+                return _extract_json(raw)
+            except ValueError as e:
+                print(f"  ⚠ JSON parse failed ({name}, attempt {attempt + 1}): {e}")
+                last_err = e
+                if attempt == 0:
+                    await asyncio.sleep(1)
+            except Exception as e:
+                print(f"  ⚠ LLM call failed ({name}, attempt {attempt + 1}): {e}")
+                last_err = e
+                break
+
+    raise Exception(f"All LLM providers failed to return valid JSON. Last error: {last_err}")
+
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "timestamp": time.time()}
+    return {"status": "ok", "version": "3.5.0"}
 
 
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest):
     if not req.query.strip():
-        raise HTTPException(400, "Query cannot be empty")
+        raise HTTPException(400, "Query is empty")
+
     try:
+        print(f"🔥 New debate: {req.query}")
         result = await engine.run(req.query)
-        debate_history.append({
+
+        record = {
             "query": req.query,
+            "timestamp": time.time(),
             "final_decision": result["final_decision"],
             "confidence": result["confidence"],
-            **{f"{s['model']}_score": s["hallucination_score"] for s in result["hallucination_scores"]},
-        })
+            "reasoning": result.get("reasoning", ""),
+            "pro_arguments": result.get("pro_arguments", []),
+            "con_arguments": result.get("con_arguments", []),
+            "rebuttals": result.get("rebuttals", {}),
+            "judge_votes": result.get("judge_votes", {}),
+            "individual_verdicts": result.get("individual_verdicts", []),
+            "hallucination_scores": result.get("hallucination_scores", []),
+            "most_hallucinating_model": result.get("most_hallucinating_model", "None"),
+            "pro_votes": result.get("judge_votes", {}).get("PRO", 0),
+            "con_votes": result.get("judge_votes", {}).get("CON", 0),
+        }
+
+        for s in result.get("hallucination_scores", []):
+            key = s["model"].replace(" ", "_").replace("/", "_") + "_score"
+            record[key] = s["hallucination_score"]
+
+        debate_history.append(record)
+        auto_save_excel(debate_history)
         return result
+
     except Exception as e:
-        raise HTTPException(500, str(e))
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Debate engine error: {str(e)}")
 
 
 @app.post("/argument")
-async def argument(req: ArgumentRequest):
-    prompt = f"""You are an expert debate coach. Build a structured logical argument.
-
+async def build_argument(req: ArgumentRequest):
+    prompt = f"""You are an expert debate coach.
 Topic: {req.topic}
 Side: {req.side}
 Audience: {req.audience}
 Tone: {req.tone}
 
-Respond with ONLY a valid JSON object (no markdown, no explanation) in this exact format:
+Return ONLY a valid JSON object. No markdown, no preamble, no explanation — ONLY the JSON.
+
 {{
-  "proposition": "One clear thesis statement for the {req.side} side",
-  "premises": [
-    "First supporting premise",
-    "Second supporting premise",
-    "Third supporting premise"
-  ],
-  "reasoning": "2-3 sentences explaining how the premises logically lead to the proposition",
+  "proposition": "One-sentence core thesis for the {req.side} side.",
+  "premises": ["Premise 1", "Premise 2", "Premise 3"],
+  "reasoning": "Two-sentence logical bridge connecting the premises to the proposition.",
   "strength": 78,
   "counters": [
-    {{"label": "Counter-argument name", "desc": "Brief description of the challenge", "severity": "high"}},
-    {{"label": "Another counter", "desc": "Brief description", "severity": "medium"}}
+    {{"label": "Strawman Risk", "severity": "medium", "desc": "Opponent may oversimplify your position."}},
+    {{"label": "Evidence Gap", "severity": "low", "desc": "Ensure statistics are up-to-date."}}
   ],
-  "tips": [
-    "One tip to strengthen this argument",
-    "Another optimization tip",
-    "Third tip"
-  ]
-}}
-
-strength must be a number 0-100. severity must be "high", "medium", or "low"."""
-
+  "tips": ["Use concrete statistics.", "Anticipate the strongest counter.", "Close with a call to action."]
+}}"""
     try:
-        # Use OpenRouter for argument building
-        raw = await call_with_fallback(prompt, primary="openrouter")
-        data = safe_json(raw)
-        data.setdefault("proposition", "A strong case exists for this position.")
-        data.setdefault("premises", ["Evidence supports this view.", "Historical precedent aligns.", "Expert consensus agrees."])
-        data.setdefault("reasoning", "These premises collectively build a compelling logical case.")
-        data.setdefault("strength", 72)
+        data = await llm_json(prompt)
+        data.setdefault("proposition", f"{req.side} side argument for: {req.topic}")
+        data.setdefault("premises", ["Supporting premise 1", "Supporting premise 2"])
+        data.setdefault("reasoning", "The premises collectively support the proposition.")
+        data.setdefault("strength", 70)
         data.setdefault("counters", [])
-        data.setdefault("tips", [])
+        data.setdefault("tips", ["Build on each premise systematically."])
         return data
     except Exception as e:
-        raise HTTPException(500, f"Argument generation failed: {str(e)}")
+        raise HTTPException(500, f"Argument builder error: {str(e)}")
 
 
 @app.post("/rebuttal")
-async def rebuttal(req: RebuttalRequest):
-    prompt = f"""You are an expert debate analyst. Analyze this argument and generate rebuttals.
-
+async def analyze_rebuttal(req: RebuttalRequest):
+    prompt = f"""You are an expert debate analyst.
 Argument to analyze:
 {req.argument}
 
-Respond with ONLY a valid JSON object (no markdown) in this exact format:
+Return ONLY a valid JSON object. No markdown, no explanation, no preamble — ONLY the JSON.
+
 {{
-  "fallacies": ["Ad Hominem", "Straw Man"],
-  "strength_score": 62,
-  "strength_label": "Moderate",
-  "confidence": 85,
+  "fallacies": ["Ad Hominem", "False Dichotomy"],
+  "strength_score": 55,
+  "strength_label": "Medium",
+  "confidence": 82,
   "rebuttals": [
-    {{"title": "Rebuttal Title", "body": "Detailed rebuttal response here"}},
-    {{"title": "Second Rebuttal", "body": "Another detailed response"}},
-    {{"title": "Third Rebuttal", "body": "Third detailed response"}}
+    {{"title": "Counter 1", "body": "Detailed rebuttal text here."}},
+    {{"title": "Counter 2", "body": "Another rebuttal here."}},
+    {{"title": "Counter 3", "body": "Third rebuttal here."}}
   ]
-}}
-
-strength_score: 0-100 (how strong the opponent's argument is).
-strength_label: "Weak", "Moderate", or "Strong".
-confidence: 0-100 (confidence in the rebuttals).
-fallacies: list up to 4 logical fallacies detected (empty array if none)."""
-
+}}"""
     try:
-        # Use Gemini for rebuttal analysis
-        raw = await call_with_fallback(prompt, primary="gemini")
-        data = safe_json(raw)
+        data = await llm_json(prompt)
         data.setdefault("fallacies", [])
         data.setdefault("strength_score", 50)
-        data.setdefault("strength_label", "Moderate")
-        data.setdefault("confidence", 80)
+        data.setdefault("strength_label", "Medium")
+        data.setdefault("confidence", 75)
         data.setdefault("rebuttals", [{"title": "General Counter", "body": "The argument lacks sufficient evidence."}])
         return data
     except Exception as e:
-        raise HTTPException(500, f"Rebuttal analysis failed: {str(e)}")
+        raise HTTPException(500, f"Rebuttal error: {str(e)}")
 
 
 @app.post("/persona")
-async def persona(req: PersonaRequest):
-    prompt = f"""You are simulating a stakeholder persona in a debate scenario.
-
+async def simulate_persona(req: PersonaRequest):
+    prompt = f"""You are simulating {req.persona_name}: {req.persona_desc}
 Topic: {req.topic}
-Persona: {req.persona_name}
-Persona Description: {req.persona_desc}
 
-Simulate how this persona would respond. Respond with ONLY a valid JSON object (no markdown):
+Return ONLY a valid JSON object. No markdown, no explanation — ONLY the JSON.
+
 {{
-  "risk_level": 45,
+  "risk_level": 62,
   "conflict_level": "Medium",
-  "key_concern": "The persona's most important concern as a direct quote in their voice",
-  "agreement_markers": [
-    "Point they agree with",
-    "Another point of agreement",
-    "Third agreement"
-  ],
-  "disagreement_markers": [
-    "Point they disagree with",
-    "Another disagreement",
-    "Third disagreement"
-  ],
-  "optimal_strategy": "2-3 sentences on the best strategy to persuade this persona"
-}}
-
-risk_level: 0-100 (how opposed this persona is).
-conflict_level: "Low", "Medium", or "High"."""
-
+  "key_concern": "One sentence describing the main concern this persona has.",
+  "agreement_markers": ["Point they agree with 1", "Point they agree with 2"],
+  "disagreement_markers": ["Point they disagree with 1", "Point they disagree with 2"],
+  "optimal_strategy": "Two sentences on how to best persuade this persona."
+}}"""
     try:
-        # Use Gemini for persona simulation
-        raw = await call_with_fallback(prompt, primary="gemini")
-        data = safe_json(raw)
+        data = await llm_json(prompt, use_gemini_first=True)
         data.setdefault("risk_level", 50)
         data.setdefault("conflict_level", "Medium")
-        data.setdefault("key_concern", "This approach needs more thorough evaluation.")
-        data.setdefault("agreement_markers", ["Some aspects are promising"])
-        data.setdefault("disagreement_markers", ["More evidence is needed"])
-        data.setdefault("optimal_strategy", "Address their core concerns directly with data-backed evidence.")
+        data.setdefault("key_concern", "This proposal needs more careful evaluation.")
+        data.setdefault("agreement_markers", ["Acknowledges the core problem"])
+        data.setdefault("disagreement_markers", ["Questions implementation feasibility"])
+        data.setdefault("optimal_strategy", "Lead with data. Address concerns directly.")
         return data
     except Exception as e:
-        raise HTTPException(500, f"Persona simulation failed: {str(e)}")
+        raise HTTPException(500, f"Persona error: {str(e)}")
 
 
 @app.post("/evidence")
-async def evidence(req: EvidenceRequest):
-    prompt = f"""You are a research assistant generating evidence cards for a debate.
-
+async def fetch_evidence(req: EvidenceRequest):
+    prompt = f"""You are a research assistant.
 Topic: {req.topic}
 Category: {req.category}
 
-Generate 4 specific, credible evidence cards. Respond with ONLY a valid JSON object (no markdown):
+Return ONLY a valid JSON object. No markdown, no explanation — ONLY the JSON.
+
 {{
   "evidence": [
     {{
-      "title": "Evidence claim title",
-      "snippet": "2-3 sentence summary of the evidence or finding",
-      "source": "Journal/Organization Name, Year",
+      "title": "Evidence claim 1",
+      "snippet": "2-3 sentence supporting detail with specifics.",
+      "source": "Source or institution name",
       "cat": "{req.category}",
-      "conf": 87
+      "conf": 88
     }},
     {{
-      "title": "Second evidence title",
-      "snippet": "Another 2-3 sentence evidence summary",
-      "source": "Source name, Year",
+      "title": "Evidence claim 2",
+      "snippet": "2-3 sentence supporting detail.",
+      "source": "Source or institution name",
       "cat": "{req.category}",
-      "conf": 92
+      "conf": 75
     }},
     {{
-      "title": "Third evidence",
-      "snippet": "Third evidence summary",
-      "source": "Source, Year",
+      "title": "Evidence claim 3",
+      "snippet": "2-3 sentence supporting detail.",
+      "source": "Source or institution name",
       "cat": "{req.category}",
-      "conf": 78
-    }},
-    {{
-      "title": "Fourth evidence",
-      "snippet": "Fourth evidence summary",
-      "source": "Source, Year",
-      "cat": "{req.category}",
-      "conf": 83
+      "conf": 82
     }}
   ]
-}}
-
-conf: 0-100 confidence/reliability score."""
-
+}}"""
     try:
-        # Alternate: use OpenRouter for evidence
-        raw = await call_with_fallback(prompt, primary="openrouter")
-        data = safe_json(raw)
-        if "evidence" not in data:
-            data = {"evidence": []}
+        data = await llm_json(prompt, use_gemini_first=True)
+        data.setdefault("evidence", [])
         return data
     except Exception as e:
-        raise HTTPException(500, f"Evidence fetch failed: {str(e)}")
+        raise HTTPException(500, f"Evidence error: {str(e)}")
 
 
 @app.post("/insights")
-async def insights(req: InsightsRequest):
-    pro_text = "\n".join(req.pro_args) if req.pro_args else "No PRO arguments provided."
-    con_text = "\n".join(req.con_args) if req.con_args else "No CON arguments provided."
-    conf_pct = round(req.confidence * 100 if req.confidence <= 1 else req.confidence)
+async def generate_insights(req: InsightsRequest):
+    conf_display = round(req.confidence * 100 if req.confidence <= 1 else req.confidence, 1)
+    prompt = f"""You are a strategic decision analyst.
+Debate Topic: {req.topic}
+Winner: {req.winner}
+Confidence: {conf_display}%
+PRO Arguments: {req.pro_args}
+CON Arguments: {req.con_args}
 
-    prompt = f"""You are an expert strategic analyst providing decision insights on a debate.
+Return ONLY a valid JSON object. No markdown, no explanation — ONLY the JSON.
 
-Topic: {req.topic}
-Debate Winner: {req.winner}
-Confidence: {conf_pct}%
-
-PRO Arguments:
-{pro_text}
-
-CON Arguments:
-{con_text}
-
-Provide comprehensive decision insights. Respond with ONLY a valid JSON object (no markdown):
 {{
   "logical_strength": 74,
-  "risk_score": 32,
+  "risk_score": 38,
   "recommendation": "GO",
-  "summary": "3-4 sentence executive summary of the debate outcome and strategic recommendation",
+  "summary": "3-4 sentence executive summary of the debate outcome.",
+  "supporting_evidence": ["Key supporting point 1", "Key supporting point 2", "Key supporting point 3"],
+  "critical_adjustments": ["Important caveat 1", "Important caveat 2"],
   "biases": [
-    {{"name": "Confirmation Bias", "level": "Low"}},
-    {{"name": "Availability Heuristic", "level": "Medium"}},
-    {{"name": "Anchoring Bias", "level": "Low"}}
-  ],
-  "supporting_evidence": [
-    "Key supporting evidence point 1",
-    "Key supporting evidence point 2",
-    "Key supporting evidence point 3"
-  ],
-  "critical_adjustments": [
-    "Critical adjustment recommendation 1",
-    "Critical adjustment recommendation 2",
-    "Critical adjustment recommendation 3"
+    {{"name": "Confirmation Bias", "level": "Medium"}},
+    {{"name": "Recency Bias", "level": "Low"}}
   ]
 }}
 
-logical_strength: 0-100. risk_score: 0-100.
-recommendation: "GO", "NO-GO", or "REVIEW".
-bias level: "Low", "Medium", or "High"."""
-
+recommendation must be exactly one of: GO, NO-GO, REVIEW"""
     try:
-        # Use Gemini for insights (strategic analysis)
-        raw = await call_with_fallback(prompt, primary="gemini")
-        data = safe_json(raw)
-        data.setdefault("logical_strength", 70)
-        data.setdefault("risk_score", 35)
-        data.setdefault("recommendation", "REVIEW")
-        data.setdefault("summary", "The debate analysis indicates a nuanced outcome requiring further consideration.")
-        data.setdefault("biases", [{"name": "Confirmation Bias", "level": "Medium"}])
-        data.setdefault("supporting_evidence", ["Strong logical foundation identified."])
-        data.setdefault("critical_adjustments", ["Consider additional evidence before final decision."])
+        data = await llm_json(prompt)
+        if data.get("recommendation") not in ("GO", "NO-GO", "REVIEW"):
+            data["recommendation"] = "REVIEW"
+        data.setdefault("logical_strength", 65)
+        data.setdefault("risk_score", 40)
+        data.setdefault("summary", f"The debate on '{req.topic}' concluded with {req.winner} winning.")
+        data.setdefault("supporting_evidence", [])
+        data.setdefault("critical_adjustments", [])
+        data.setdefault("biases", [])
         return data
     except Exception as e:
-        raise HTTPException(500, f"Insights generation failed: {str(e)}")
+        raise HTTPException(500, f"Insights error: {str(e)}")
+
+
+@app.get("/history")
+def get_history():
+    return debate_history
 
 
 @app.get("/export")
 def export():
     return build_excel(debate_history)
-
-
-@app.get("/history")
-def history():
-    return debate_history
